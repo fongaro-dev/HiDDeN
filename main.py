@@ -1,47 +1,47 @@
+# %%
 import time
 import tensorflow as tf
 import tensorflow_datasets as tfds
 from tensorflow import _keras
 
-from datetime import datetime
-from packaging import version
+from tensorboard_utils import *
+
 from dataset_utils import split_dataset
+
+from tqdm import tqdm
 
 import numpy as np
 import os
 import os, stat
 import shutil
+import time
 
-from models import create_encoder_model, create_decoder_model
+from models import *
 from losses import rgb_diff
 
-from IPython import display
+# %% [markdown]
+# ## Load the dataset
 
+# %%
 def remove_readonly(func, path, _):
     "Clear the readonly bit and reattempt the removal"
     os.chmod(path, stat.S_IWRITE)
     func(path)
 
-# Clear out any prior log data.
-shutil.rmtree("logs", onerror=remove_readonly)
-
-# Sets up a timestamped log directory.
-current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
-encoder_log_dir = 'logs/gradient_tape/' + current_time + '/encoder'
-decoder_log_dir = 'logs/gradient_tape/' + current_time + '/decoder'
-encoder_summary_writer = tf.summary.create_file_writer(encoder_log_dir)
-decoder_summary_writer = tf.summary.create_file_writer(decoder_log_dir)
-
-# Sets up a timestamped log directory.
-logdir = "logs/train_data/" + current_time
-file_writer = tf.summary.create_file_writer(logdir)
-
-
-
+print("Loading dataset")
 split0, split1 = tfds.even_splits('all', n=2)
 ds_cover = tfds.load('stl10', split=split0 , shuffle_files=True)
 ds_hidden = tfds.load('stl10', split=split1 , shuffle_files=True)
+print("Loaded dataset")
 
+
+print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
+
+BATCH_SIZE = 32
+strategy = tf.distribute.MirroredStrategy(devices=None)
+GLOBAL_BATCH_SIZE = strategy.num_replicas_in_sync * BATCH_SIZE
+
+print(f'Number of devices: {strategy.num_replicas_in_sync}')
 
 [ds_cover_train,  ds_cover_val , ds_cover_test] = split_dataset(ds_cover)
 [ds_hidden_train, ds_hidden_val, ds_hidden_test] = split_dataset(ds_hidden)
@@ -50,121 +50,226 @@ ds_hidden = tfds.load('stl10', split=split1 , shuffle_files=True)
 print(f"Length of clear train set: {len(ds_cover_train)}, validation: {len(ds_cover_val)}, and test: {len(ds_cover_test)}")
 print(f"Length of hidden train set: {len(ds_hidden_train)}, validation: {len(ds_hidden_val)}, and test: {len(ds_hidden_test)}")
 
-# train_data = ds_cover_train.load_data()
 
-tensor_img_batch = list(ds_cover_train)[0]['image']
-
-# with file_writer.as_default():
-#   # Don't forget to reshape.
-#   images = np.reshape(tensor_img_batch[0:25], (-1, 96, 96, 3))
-#   tf.summary.image("25 training data examples", images, max_outputs=25, step=0)
+NUM_TRAIN_SAMPLES = len(ds_cover_train)
+NUM_VAL_SAMPLES = len(ds_hidden_val)
+TRAIN_STEPS = ceil(NUM_TRAIN_SAMPLES / GLOBAL_BATCH_SIZE)
+TEST_STEPS = ceil(NUM_VAL_SAMPLES / GLOBAL_BATCH_SIZE)
 
 def normalize(ds):
     # print(image)
     image_ds = (tf.cast(ds['image'],tf.float32)) / 255.0
     return image_ds
 
-ds_cover_train = ds_cover_train.map(normalize)
-ds_cover_val = ds_cover_val.map(normalize)
-ds_cover_test = ds_cover_test.map(normalize)
-ds_hidden_train = ds_hidden_train.map(normalize)
-ds_hidden_val = ds_hidden_val.map(normalize)
-ds_hidden_test = ds_hidden_test.map(normalize)
+ds_cover_train = ds_cover_train.map(normalize, num_parallel_calls = tf.data.AUTOTUNE)
+ds_cover_train = ds_cover_train.cache()
+ds_hidden_train = ds_hidden_train.map(normalize, num_parallel_calls = tf.data.AUTOTUNE)
+ds_hidden_train = ds_hidden_train.cache()
 
-# Example usage:
+ds_train = tf.data.Dataset.zip((ds_cover_train, ds_hidden_train)).batch(GLOBAL_BATCH_SIZE).prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+ds_hidden_val = ds_hidden_val.map(normalize, num_parallel_calls = tf.data.AUTOTUNE)
+ds_hidden_val = ds_hidden_val.cache()
+ds_cover_val = ds_cover_val.map(normalize, num_parallel_calls = tf.data.AUTOTUNE)
+ds_cover_val = ds_cover_val.cache()
+
+ds_val = tf.data.Dataset.zip((ds_cover_val, ds_hidden_val)).batch(GLOBAL_BATCH_SIZE).prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+ds_hidden_test = ds_hidden_test.map(normalize, num_parallel_calls = tf.data.AUTOTUNE)
+ds_hidden_test = ds_hidden_test.cache()
+ds_cover_test = ds_cover_test.map(normalize, num_parallel_calls = tf.data.AUTOTUNE)
+ds_cover_test = ds_cover_test.cache()
+
+ds_test = tf.data.Dataset.zip((ds_cover_test, ds_hidden_test)).batch(GLOBAL_BATCH_SIZE, ).prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+plot_ds = tf.data.Dataset.zip(
+    (ds_cover_test.take(5).batch(1), ds_hidden_test.take(5).batch(1)))
+
+# create distributed datasets
+ds_train = strategy.experimental_distribute_dataset(ds_train)
+ds_val = strategy.experimental_distribute_dataset(ds_val)
+ds_test = strategy.experimental_distribute_dataset(ds_test)
+
+# %% [markdown]
+# ## Define the training steps
+
+# %%
+
+# Create the model within strategy scope
 input_shape = (96, 96, 3)  # Adjust input size as needed
-encoder_model = create_encoder_model(input_shape)
-decoder_model = create_decoder_model(input_shape)
+with strategy.scope():
+    enc_dec_model = create_encoder_decoder_model(input_shape)
 
-encoder_model.summary()
-decoder_model.summary()
+    enc_dec_model.summary()
 
-encoder_optimizer = tf.keras.optimizers.Adam(1e-4)
-decoder_optimizer = tf.keras.optimizers.Adam(1e-4)
+    enc_dec_optimizer = tf.keras.optimizers.Adam(learning_rate=2e-4,
+                                            beta_1=0.5,
+                                            beta_2=0.9)
 
-checkpoint_dir = './training_checkpoints'
-checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
-checkpoint = tf.train.Checkpoint(encoder_optimizer=encoder_optimizer,
-                                 decoder_optimizer=decoder_optimizer,
-                                 encoder_model=encoder_model,
-                                 decoder_model=decoder_model)
+    checkpoint_dir = './training_checkpoints'
+    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+    checkpoint = tf.train.Checkpoint(encoder_optimizer=enc_dec_optimizer,
+                                    decoder_encoder=enc_dec_model)
 
-train_loss_enc = tf.keras.metrics.Mean('train_loss_enc', dtype=tf.float32)
-train_loss_dec = tf.keras.metrics.Mean('train_loss_dec', dtype=tf.float32)
 
+
+def reduce_mean(per_sample_loss):
+    """ return the global mean of per-sample loss """
+    return tf.reduce_sum(per_sample_loss) / GLOBAL_BATCH_SIZE
+
+enc_weigh = 0.4
+dec_weigh = 0.6
 # Notice the use of `tf.function`
 # This annotation causes the function to be "compiled".
 @tf.function
 def train_step(cover_imgs, hidden_imgs):
-    with tf.GradientTape() as enc_tape, tf.GradientTape() as dec_tape:
-      encoded_imgs = encoder_model([cover_imgs, hidden_imgs], training=True)
-      decoded_imgs = decoder_model(encoded_imgs, training=True)
+    result = {}
+    with tf.GradientTape() as tape:
+        [encoded_imgs, decoded_imgs] = enc_dec_model([cover_imgs, hidden_imgs], training=True)
 
-      enc_loss = rgb_diff(encoded_imgs, cover_imgs)
-      dec_loss = rgb_diff(decoded_imgs, hidden_imgs)
+        enc_loss = reduce_mean(rgb_diff(encoded_imgs, cover_imgs))
+        dec_loss = reduce_mean(rgb_diff(decoded_imgs, hidden_imgs))
 
-    train_loss_enc(enc_loss)
-    train_loss_dec(dec_loss)
-
-    gradients_of_encoder = enc_tape.gradient(enc_loss, encoder_model.trainable_variables)
-    gradients_of_decoder = dec_tape.gradient(dec_loss, decoder_model.trainable_variables)
-
-    encoder_optimizer.apply_gradients(zip(gradients_of_encoder, encoder_model.trainable_variables))
-    decoder_optimizer.apply_gradients(zip(gradients_of_decoder, decoder_model.trainable_variables))
+        total_loss = enc_weigh * enc_loss + dec_weigh * dec_loss
 
 
-val_loss_enc = tf.keras.metrics.Mean('val_loss_enc', dtype=tf.float32)
-val_loss_dec = tf.keras.metrics.Mean('val_loss_dec', dtype=tf.float32)
+    result.update({
+    'train/loss_enc': enc_loss,
+    'train/loss_dec': dec_loss,
+    'train/total_loss': total_loss,
+    })
 
+    enc_dec_optimizer.minimize(loss=total_loss, var_list=enc_dec_model.trainable_variables, tape = tape)
+
+    return result
+
+
+def reduce_dict(d: dict):
+  """ inplace reduction of items in dictionary d """
+  return {
+        k: strategy.reduce(tf.distribute.ReduceOp.SUM, v, axis=None)
+        for k, v in d.items()
+  }
 
 @tf.function
+def distributed_train_step(x, y):
+    results = strategy.run(train_step, args=(x, y))
+    results = reduce_dict(results)
+    return results
+
 def test_step(cover_val, hidden_val):
-    encoded_imgs = encoder_model([cover_val, hidden_val], training=True)
-    decoded_imgs = decoder_model(encoded_imgs, training=True)
+    result = {}
+    [encoded_imgs, decoded_imgs] = enc_dec_model([cover_val, hidden_val], training=False)
 
-    enc_loss = rgb_diff(encoded_imgs, cover_val)
-    dec_loss = rgb_diff(decoded_imgs, hidden_val)
+    enc_loss = reduce_mean(rgb_diff(encoded_imgs, cover_val))
+    dec_loss = reduce_mean(rgb_diff(decoded_imgs, hidden_val))
 
-    val_loss_enc(enc_loss)
-    val_loss_dec(dec_loss)
+    total_loss = enc_weigh * enc_loss + dec_weigh * dec_loss
 
-def train(cover_ds, hidden_ds, epochs):
-  for epoch in range(epochs):
+    result.update({
+    'val/loss_enc': enc_loss,
+    'val/loss_dec': dec_loss,
+    'val/total_loss': total_loss,
+    })
+
+    return result
+
+@tf.function
+def distributed_test_step(x, y):
+    results = strategy.run(test_step, args=(x, y))
+    results = reduce_dict(results)
+    return results
+
+def train(ds, summary, epoch: int):
+    results = {}
+    for cover_batch, hidden_batch in tqdm(ds, total=TRAIN_STEPS):
+        result = distributed_train_step(cover_batch, hidden_batch)
+        append_dict(results, result)
+    for key, value in results.items():
+        results[key] = tf.reduce_mean(value)
+        summary.scalar(key, results[key], step=epoch, training=True)
+    return results
+
+
+def test(ds, summary, epoch: int):
+    results = {}
+    for cover_batch, hidden_batch in tqdm(ds, total=TEST_STEPS):
+        result = distributed_test_step(cover_batch, hidden_batch)
+        append_dict(results, result)
+    for key, value in results.items():
+        results[key] = tf.reduce_mean(value)
+        summary.scalar(key, results[key], step=epoch, training=False)
+    return results
+
+# %% [markdown]
+# ## Debugging functions
+
+# %%
+
+def plot_cycle(ds, summary, epoch: int):
+    """ plot X -> G(X) -> F(G(X)) and Y -> F(Y) -> G(F(Y)) """
+    samples = {}
+    for cover_img, hidden_img in ds:
+        [encoded_img, decoded_img] = enc_dec_model([cover_img, hidden_img], training=False)
+        append_dict(dict1=samples,
+                    dict2={
+                        'cover_img': cover_img,
+                        'hidden_img': hidden_img,
+                        'encoded_img': encoded_img,
+                        'decoded_img': decoded_img
+                    })
+    for key, images in samples.items():
+        # scale images back to [0, 255]
+        images = tf.concat(images, axis=0).numpy()
+        images = (images * 255.0).astype(np.uint8)
+        samples[key] = images
+    summary.image_cycle(
+        tag=f'Encoding Cycle',
+        images=[samples['cover_img'], samples['hidden_img'], samples['encoded_img'], samples['decoded_img']],
+        labels=['cover_img', 'hidden_img', 'encoded_img', 'decoded_img'],
+        step=epoch,
+        training=False)
+
+
+OUTPUT_DIR = 'runs'  # directory to store checkpoint and TensorBoard summary
+
+if os.path.exists(OUTPUT_DIR):
+    # Clear out any prior log data.
+    shutil.rmtree(OUTPUT_DIR, onerror=remove_readonly)
+os.makedirs(OUTPUT_DIR)
+
+summary = Summary(output_dir=OUTPUT_DIR)
+
+# %% [markdown]
+# # Train
+
+# %% [markdown]
+# ### (Optional) Load Checkpoint
+
+# %%
+CKPT_PATH = "./ckpt"
+
+# %%
+NUM_EPOCHS = 20
+checkpoint_manager = tf.train.CheckpointManager(checkpoint, CKPT_PATH, max_to_keep=3)
+
+for epoch in range(NUM_EPOCHS):
+    print(f'Epoch {epoch + 1:03d}/{NUM_EPOCHS:03d}')
     start = time.time()
-    cover_it = iter(cover_ds)
-    hidden_it = iter(hidden_ds)
-    for cover_batch, hidden_batch in zip(cover_it, hidden_it):
-      train_step(cover_batch, hidden_batch)
-    
-    
-    cover_it_val = iter(ds_cover_val)
-    hidden_it_val = iter(ds_hidden_val)
-    for cover_val_batch, hidden_val_batch in zip(cover_it_val, hidden_it_val):
-        test_step(cover_val_batch, hidden_val_batch)
-    
-    with encoder_summary_writer.as_default():
-        tf.summary.scalar('train_loss_enc', train_loss_enc.result(), step=epoch)
-        tf.summary.scalar('val_loss_enc', val_loss_enc.result(), step=epoch)
-        
-    with decoder_summary_writer.as_default():
-        tf.summary.scalar('train_loss_dec', train_loss_dec.result(), step=epoch)
-        tf.summary.scalar('val_loss_dec', val_loss_dec.result(), step=epoch)
-    
-    with encoder_summary_writer.as_default():
-        # Don't forget to reshape.
-        cover_img = ds_cover_val[0];
-        hidden_img = ds_hidden_val[0];
-        encoded_img = encoder_model([cover_img, hidden_img], training=False)
-        decoded_img = decoder_model(encoded_img[0], training=False)
-        images = np.reshape([cover_img, hidden_img, encoded_img, decoded_img], (-1, 96, 96, 3))
-        tf.summary.image("Images at epoch: " + epoch, images, max_outputs=4, step=0)
-    
+    train_results = train(ds_train, summary, epoch)
+    test_results = test(ds_val, summary, epoch)
+    end = time.time()
 
-    # Save the model every 15 epochs
-    if (epoch + 1) % 15 == 0:
-      checkpoint.save(file_prefix = checkpoint_prefix)
+    print(f'train/loss_enc: {train_results["train/loss_enc"]:.04f}\t\t'
+            f'train/loss_dec: {train_results["train/loss_dec"]:.04f}\n'
+            f'train/total_loss: {train_results["train/total_loss"]:.04f}\n'
+            f'val/loss_enc: {test_results["val/loss_enc"]:.04f}\t\t'
+            f'val/loss_dec: {test_results["val/loss_dec"]:.04f}\n'
+            f'val/total_loss: {test_results["val/total_loss"]:.04f}\n'
+            f'Elapse: {end - start:.02f}s\n')
 
-    print ('Time for epoch {} is {} sec'.format(epoch + 1, time.time()-start))
-    
-EPOCHS = 5
-train(ds_cover_train, ds_hidden_train, EPOCHS)
+    if (epoch + 1) % 5 == 0 or epoch == NUM_EPOCHS - 1:
+        save_path = checkpoint_manager.save()
+        plot_cycle(plot_ds, summary, epoch)
+
+
